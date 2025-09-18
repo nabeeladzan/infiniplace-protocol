@@ -1,16 +1,19 @@
+"use strict";
 // packages/shared/src/protocol.ts
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.isCompatible = exports.isValidColorIndex = exports.DEFAULT_BASELINE_PALETTE_ORDINAL = exports.DEFAULT_BASELINE_PALETTE_ID = exports.DEFAULT_BASELINE_COLOR_INDEX = exports.findColorIndex = exports.DEFAULT_PALETTE = exports.ordinalToPaletteId = exports.paletteIdToOrdinal = exports.getPaletteById = exports.PALETTE_SET = exports.SHADES_PALETTE = exports.EARTH_PALETTE = exports.CLASSIC_PALETTE = exports.WS = exports.tileKey = exports.toCenteredPixelCoord = exports.toPixelCoord = exports.toTileOffset = exports.toTileCoord = exports.PROTOCOL_VERSION = exports.TILE_SIZE = void 0;
 // ---- Core constants ----
 /**
  * Size of each tile in pixels (64x64).
  * This is a fundamental constant - changing it requires data migration
  * as it affects coordinate calculations and stored tile data.
  */
-export const TILE_SIZE = 64;
+exports.TILE_SIZE = 64;
 /**
  * Protocol version for compatibility checking between client and server.
  * Increment when making breaking changes to the wire protocol.
  */
-export const PROTOCOL_VERSION = 1;
+exports.PROTOCOL_VERSION = 1;
 /**
  * Coordinate conversion utilities - these are pure functions with no runtime dependencies.
  */
@@ -18,37 +21,42 @@ export const PROTOCOL_VERSION = 1;
  * Convert global pixel coordinates to tile coordinates.
  * Determines which tile contains the given pixel position.
  */
-export const toTileCoord = (x, y) => ({
-    tx: Math.floor(x / TILE_SIZE),
-    ty: Math.floor(y / TILE_SIZE),
+const toTileCoord = (x, y) => ({
+    tx: Math.floor(x / exports.TILE_SIZE),
+    ty: Math.floor(y / exports.TILE_SIZE),
 });
+exports.toTileCoord = toTileCoord;
 /**
  * Convert global pixel coordinates to intra-tile offset.
  * Determines the pixel's position within its containing tile.
  * Handles negative coordinates correctly using modulo arithmetic.
  */
-export const toTileOffset = (x, y) => {
-    const ox = ((x % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
-    const oy = ((y % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
+const toTileOffset = (x, y) => {
+    const ox = ((x % exports.TILE_SIZE) + exports.TILE_SIZE) % exports.TILE_SIZE;
+    const oy = ((y % exports.TILE_SIZE) + exports.TILE_SIZE) % exports.TILE_SIZE;
     return { ox: ox, oy: oy };
 };
-export const toPixelCoord = (tx, ty) => ({
-    x: (tx * TILE_SIZE),
-    y: (ty * TILE_SIZE),
+exports.toTileOffset = toTileOffset;
+const toPixelCoord = (tx, ty) => ({
+    x: (tx * exports.TILE_SIZE),
+    y: (ty * exports.TILE_SIZE),
 });
+exports.toPixelCoord = toPixelCoord;
 /**
  * Convert tile coordinates to the pixel coordinates of the tile's center.
  * Useful for centering the viewport on a specific tile.
  */
-export const toCenteredPixelCoord = (tx, ty) => ({
-    x: (tx * TILE_SIZE + TILE_SIZE / 2),
-    y: (ty * TILE_SIZE + TILE_SIZE / 2),
+const toCenteredPixelCoord = (tx, ty) => ({
+    x: (tx * exports.TILE_SIZE + exports.TILE_SIZE / 2),
+    y: (ty * exports.TILE_SIZE + exports.TILE_SIZE / 2),
 });
+exports.toCenteredPixelCoord = toCenteredPixelCoord;
 /**
  * Generate a unique string key for a tile coordinate.
  * Used for tile caching, lookup maps, and persistence keys.
  */
-export const tileKey = (tx, ty) => `${tx}:${ty}`;
+const tileKey = (tx, ty) => `${tx}:${ty}`;
+exports.tileKey = tileKey;
 // =======================================================
 //           WebSocket Real-Time Communication Protocol
 // =======================================================
@@ -62,7 +70,7 @@ export const tileKey = (tx, ty) => `${tx}:${ty}`;
  * The protocol follows a request-response pattern for some operations
  * and server-push for real-time updates.
  */
-export const WS = {
+exports.WS = {
     // ---- Client -> Server Events ----
     SUB: 'SUB', // Subscribe to tile updates (viewport management)
     UNSUB: 'UNSUB', // Unsubscribe from tiles no longer in view
@@ -88,7 +96,7 @@ export const WS = {
  *
  * This palette is designed for pixel art and collaborative drawing.
  */
-export const CLASSIC_PALETTE = {
+exports.CLASSIC_PALETTE = {
     id: 'classic',
     name: 'Classic',
     version: 3,
@@ -120,7 +128,7 @@ export const CLASSIC_PALETTE = {
  * - Rich browns and deep chocolates for shadows
  * - Near-black browns for darkest areas
  */
-export const EARTH_PALETTE = {
+exports.EARTH_PALETTE = {
     id: 'earth',
     name: 'Earth Tones',
     version: 1,
@@ -152,7 +160,7 @@ export const EARTH_PALETTE = {
  * - Dark tones for shadows and depth
  * - Near-black for maximum contrast
  */
-export const SHADES_PALETTE = {
+exports.SHADES_PALETTE = {
     id: 'shades',
     name: 'Shades',
     version: 1,
@@ -178,59 +186,64 @@ export const SHADES_PALETTE = {
 /**
  * Complete palette set containing all available palettes.
  */
-export const PALETTE_SET = {
-    palettes: [CLASSIC_PALETTE, EARTH_PALETTE, SHADES_PALETTE],
-    defaultPaletteId: CLASSIC_PALETTE.id,
+exports.PALETTE_SET = {
+    palettes: [exports.CLASSIC_PALETTE, exports.EARTH_PALETTE, exports.SHADES_PALETTE],
+    defaultPaletteId: exports.CLASSIC_PALETTE.id,
 };
 /**
  * Get a palette by its ID.
  */
-export const getPaletteById = (id) => {
-    return PALETTE_SET.palettes.find((palette) => palette.id === id);
+const getPaletteById = (id) => {
+    return exports.PALETTE_SET.palettes.find((palette) => palette.id === id);
 };
+exports.getPaletteById = getPaletteById;
 const PALETTE_INDEX_BY_ID = (() => {
     const map = {};
-    PALETTE_SET.palettes.forEach((pal, idx) => {
+    exports.PALETTE_SET.palettes.forEach((pal, idx) => {
         map[pal.id] = idx;
     });
     return map;
 })();
 /** Resolve palette id to its ordinal within the palette set. */
-export const paletteIdToOrdinal = (id) => {
+const paletteIdToOrdinal = (id) => {
     const idx = PALETTE_INDEX_BY_ID[id];
-    return Number.isInteger(idx) ? idx : PALETTE_INDEX_BY_ID[DEFAULT_PALETTE.id];
+    return Number.isInteger(idx) ? idx : PALETTE_INDEX_BY_ID[exports.DEFAULT_PALETTE.id];
 };
+exports.paletteIdToOrdinal = paletteIdToOrdinal;
 /** Resolve ordinal back to palette id. */
-export const ordinalToPaletteId = (ordinal) => {
-    const pal = PALETTE_SET.palettes[ordinal];
-    return pal ? pal.id : DEFAULT_PALETTE.id;
+const ordinalToPaletteId = (ordinal) => {
+    const pal = exports.PALETTE_SET.palettes[ordinal];
+    return pal ? pal.id : exports.DEFAULT_PALETTE.id;
 };
+exports.ordinalToPaletteId = ordinalToPaletteId;
 /**
  * Get the default palette.
  */
-export const DEFAULT_PALETTE = CLASSIC_PALETTE;
+exports.DEFAULT_PALETTE = exports.CLASSIC_PALETTE;
 /** Resolve the index of a color string in a palette. Accepts #RRGGBB or #RRGGBBAA. */
-export const findColorIndex = (color, palette = DEFAULT_PALETTE) => {
+const findColorIndex = (color, palette = exports.DEFAULT_PALETTE) => {
     const norm = (hex) => hex.length === 7 ? `${hex.toUpperCase()}FF` : hex.toUpperCase();
     const target = norm(color);
     return palette.colors.findIndex((c) => norm(c) === target);
 };
+exports.findColorIndex = findColorIndex;
 /** Baseline background color index (white) for default tiles. */
-export const DEFAULT_BASELINE_COLOR_INDEX = (() => {
-    const idx = findColorIndex('#FFFFFF');
+exports.DEFAULT_BASELINE_COLOR_INDEX = (() => {
+    const idx = (0, exports.findColorIndex)('#FFFFFF');
     return idx >= 0 ? idx : 0;
 })();
 /** Baseline palette id assigned to untouched pixels. */
-export const DEFAULT_BASELINE_PALETTE_ID = DEFAULT_PALETTE.id;
+exports.DEFAULT_BASELINE_PALETTE_ID = exports.DEFAULT_PALETTE.id;
 /** Baseline palette ordinal, paired with DEFAULT_BASELINE_PALETTE_ID. */
-export const DEFAULT_BASELINE_PALETTE_ORDINAL = paletteIdToOrdinal(DEFAULT_BASELINE_PALETTE_ID);
+exports.DEFAULT_BASELINE_PALETTE_ORDINAL = (0, exports.paletteIdToOrdinal)(exports.DEFAULT_BASELINE_PALETTE_ID);
 /**
  * Runtime validation helper for color indices.
  *
  * Checks if a numeric value is a valid index into the given palette.
  * Useful for validating paint requests and preventing array bounds errors.
  */
-export const isValidColorIndex = (idx, palette = DEFAULT_PALETTE) => Number.isInteger(idx) && idx >= 0 && idx < palette.colors.length;
+const isValidColorIndex = (idx, palette = exports.DEFAULT_PALETTE) => Number.isInteger(idx) && idx >= 0 && idx < palette.colors.length;
+exports.isValidColorIndex = isValidColorIndex;
 /**
  * Compatibility checker for protocol handshake.
  *
@@ -240,5 +253,6 @@ export const isValidColorIndex = (idx, palette = DEFAULT_PALETTE) => Number.isIn
  * In production, you might want more sophisticated compatibility logic
  * that allows minor version differences or provides upgrade guidance.
  */
-export const isCompatible = (server) => server.protocolVersion === PROTOCOL_VERSION && server.tileSize === TILE_SIZE;
+const isCompatible = (server) => server.protocolVersion === exports.PROTOCOL_VERSION && server.tileSize === exports.TILE_SIZE;
+exports.isCompatible = isCompatible;
 //# sourceMappingURL=protocol.js.map

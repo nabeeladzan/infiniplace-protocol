@@ -1,0 +1,905 @@
+// packages/shared/src/protocol.ts
+
+/* =========================================================
+ *  InfiniPlace Canvas Protocol & Data Model (Shared)
+ *
+ *  This file defines the complete communication protocol for a collaborative
+ *  infinite pixel canvas application (similar to r/place). The protocol is
+ *  designed to be:
+ *  - Efficient: Uses tile-based architecture and delta updates
+ *  - Scalable: Supports infinite canvas size through tiling
+ *  - Real-time: WebSocket-based for instant collaboration
+ *  - Compact: Palette-indexed colors and binary deltas
+ *
+ *  Palette Versioning (Append-Only)
+ *  - Colors are referenced by index into a versioned palette.
+ *  - We treat the palette as append-only: never reorder/remove; only add colors.
+ *  - The server stamps each DB write with DEFAULT_PALETTE.version.
+ *  - INIT_TILE exposes paletteVersion so clients can verify compatibility.
+ *  - If versions differ, clients should refuse to paint (and prompt update).
+ *
+ *  Architecture Overview:
+ *  - Canvas divided into 256x256 pixel tiles
+ *  - Each tile has monotonic sequence numbers for ordering
+ *  - Initial state via HTTP snapshots, updates via WebSocket deltas
+ *  - Shared between client (React) and server (NestJS) for type safety
+ * =======================================================*/
+
+// ---- Branding helper (opaque nominal types) ----
+/**
+ * TypeScript branded types pattern for compile-time safety.
+ * Prevents mixing different coordinate systems or numeric types.
+ * e.g., PixelX cannot be accidentally used where TileX is expected.
+ */
+type Brand<T, B extends string> = T & { readonly __brand: B };
+
+// ---- Core constants ----
+/**
+ * Size of each tile in pixels (64x64).
+ * This is a fundamental constant - changing it requires data migration
+ * as it affects coordinate calculations and stored tile data.
+ */
+export const TILE_SIZE = 64 as const;
+
+/**
+ * Protocol version for compatibility checking between client and server.
+ * Increment when making breaking changes to the wire protocol.
+ */
+export const PROTOCOL_VERSION = 1 as const;
+
+// ---- Coordinates & indexing ----
+/**
+ * Global pixel coordinates - can extend infinitely in all directions.
+ * These are the "world coordinates" that users see and interact with.
+ */
+export type PixelX = Brand<number, 'PixelX'>; // global pixel X coordinate (can be negative for infinite canvas)
+export type PixelY = Brand<number, 'PixelY'>; // global pixel Y coordinate (can be negative for infinite canvas)
+
+/**
+ * Tile coordinates - which 256x256 tile a pixel belongs to.
+ * Calculated by dividing pixel coordinates by TILE_SIZE.
+ */
+export type TileX = Brand<number, 'TileX'>; // tile column index (can be negative)
+export type TileY = Brand<number, 'TileY'>; // tile row index (can be negative)
+
+/**
+ * A point in global pixel coordinate space.
+ * This is what users interact with directly.
+ */
+export interface PixelCoord {
+  x: PixelX; // global X position in pixels
+  y: PixelY; // global Y position in pixels
+}
+
+/**
+ * A tile's position in the tile grid.
+ * Each tile represents a 256x256 pixel region.
+ */
+export interface TileCoord {
+  tx: TileX; // tile X coordinate (which column)
+  ty: TileY; // tile Y coordinate (which row)
+}
+
+/**
+ * Position within a single tile (0 to TILE_SIZE-1).
+ * Used for addressing individual pixels within a tile.
+ */
+export type OffsetX = Brand<number, 'OffsetX'>; // horizontal offset within tile (0-255)
+export type OffsetY = Brand<number, 'OffsetY'>; // vertical offset within tile (0-255)
+
+/**
+ * A pixel's position relative to its containing tile's top-left corner.
+ */
+export interface TileOffset {
+  ox: OffsetX; // X offset within the tile (0..255 for TILE_SIZE=256)
+  oy: OffsetY; // Y offset within the tile (0..255 for TILE_SIZE=256)
+}
+
+/**
+ * Coordinate conversion utilities - these are pure functions with no runtime dependencies.
+ */
+
+/**
+ * Convert global pixel coordinates to tile coordinates.
+ * Determines which tile contains the given pixel position.
+ */
+export const toTileCoord = (x: number, y: number): TileCoord => ({
+  tx: Math.floor(x / TILE_SIZE) as TileX,
+  ty: Math.floor(y / TILE_SIZE) as TileY,
+});
+
+/**
+ * Convert global pixel coordinates to intra-tile offset.
+ * Determines the pixel's position within its containing tile.
+ * Handles negative coordinates correctly using modulo arithmetic.
+ */
+export const toTileOffset = (x: number, y: number): TileOffset => {
+  const ox = ((x % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
+  const oy = ((y % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
+  return { ox: ox as OffsetX, oy: oy as OffsetY };
+};
+
+export const toPixelCoord = (tx: number, ty: number): PixelCoord => ({
+  x: (tx * TILE_SIZE) as PixelX,
+  y: (ty * TILE_SIZE) as PixelY,
+});
+
+/**
+ * Convert tile coordinates to the pixel coordinates of the tile's center.
+ * Useful for centering the viewport on a specific tile.
+ */
+export const toCenteredPixelCoord = (tx: number, ty: number): PixelCoord => ({
+  x: (tx * TILE_SIZE + TILE_SIZE / 2) as PixelX,
+  y: (ty * TILE_SIZE + TILE_SIZE / 2) as PixelY,
+});
+
+/**
+ * Generate a unique string key for a tile coordinate.
+ * Used for tile caching, lookup maps, and persistence keys.
+ */
+export const tileKey = (tx: TileX | number, ty: TileY | number) =>
+  `${tx}:${ty}` as const;
+
+// ---- Color model ----
+/**
+ * Palette-indexed color system for efficient network transmission.
+ *
+ * Instead of sending full RGBA values (32 bits per pixel), we use
+ * palette indices (typically 5-6 bits) to reference a shared color palette.
+ * This dramatically reduces bandwidth for pixel updates and ensures
+ * color consistency across all clients.
+ *
+ * Example: Index 0 might be black, index 1 white, etc.
+ * The palette is versioned to handle updates across deployments.
+ */
+export type ColorIndex = Brand<number, 'ColorIndex'>; // index into the shared color palette (e.g., 0-31 for 32-color palette)
+
+/**
+ * Optional raw RGBA color representation for internal rendering.
+ * Not transmitted over the wire - only used for local rendering after
+ * palette lookup. Format depends on your graphics library (ABGR vs RGBA).
+ */
+export type RGBA = Brand<number, 'RGBA_u32'>; // 32-bit color value for internal use
+
+// ---- Sequencing ----
+/**
+ * Per-tile monotonic sequence numbers for ordering updates.
+ *
+ * Each tile maintains its own sequence counter that increments
+ * with every accepted change. This enables:
+ * - Ordered delta application (apply seq 5 before seq 6)
+ * - Gap detection (if client has seq 3 and receives seq 6, it knows seq 4-5 are missing)
+ * - Conflict resolution (newer sequence wins)
+ * - Efficient synchronization (client can request "all changes since seq X")
+ */
+export type TileSeq = Brand<number, 'TileSeq'>; // monotonic sequence number per tile
+
+// ---- Snapshot metadata ----
+/**
+ * Tile snapshot metadata for initial tile loading.
+ *
+ * When a client first subscribes to a tile, the server provides a snapshot
+ * containing the current state. This includes a compressed image (PNG/WebP)
+ * served via HTTP GET, along with metadata for caching and synchronization.
+ *
+ * Snapshots are generated periodically or after significant changes to
+ * reduce the delta chain length and improve client sync performance.
+ */
+export interface TileSnapshotMeta {
+  tx: TileX; // which tile this snapshot represents
+  ty: TileY; // tile coordinates
+  /**
+   * Sequence number at the time this snapshot was generated.
+   * Client can request deltas "since seq X" to get incremental updates.
+   */
+  seq: TileSeq;
+  /**
+   * HTTP URL where the compressed tile image can be downloaded.
+   * Typically serves PNG or WebP format optimized for pixel art.
+   */
+  snapshotUrl: string;
+  /**
+   * Palette version this snapshot was rendered with.
+   * Must match client palette version for correct color interpretation.
+   */
+  paletteVersion: number;
+  /**
+   * Optional palette identifier the tile/snapshot uses.
+   * Clients should render this tile using this palette for correct colors.
+   */
+  paletteId?: string;
+  /**
+   * Optional HTTP ETag header value for efficient caching.
+   * Allows client to use "If-None-Match" requests to avoid re-downloading unchanged snapshots.
+   */
+  etag?: string;
+  /**
+   * Optional HTTP Last-Modified timestamp (RFC 7231 format).
+   * Enables conditional requests with "If-Modified-Since" header.
+   */
+  lastModified?: string;
+}
+
+// ---- Delta payloads (diffs) ----
+/**
+ * A single pixel change within a tile.
+ * This is the atomic unit of canvas modification.
+ */
+export interface PixelChange {
+  ox: OffsetX; // X position within the tile (0-255)
+  oy: OffsetY; // Y position within the tile (0-255)
+  color: ColorIndex; // new color index within the selected palette
+  paletteId: string; // palette applied to this pixel
+}
+
+/**
+ * A batch of pixel changes for a specific tile.
+ *
+ * Delta updates are the core of the real-time collaboration system.
+ * Instead of sending full tile images for every change, we send
+ * only the modified pixels. This dramatically reduces bandwidth
+ * and enables smooth real-time collaboration.
+ *
+ * Deltas must be applied in sequence order to maintain consistency.
+ */
+export interface TileDelta {
+  tx: TileX; // target tile X coordinate
+  ty: TileY; // target tile Y coordinate
+  seq: TileSeq; // sequence number for this batch of changes
+  /**
+   * List of pixel modifications in this delta.
+   * Each change represents one user's paint action or one pixel
+   * in a larger drawing operation.
+   */
+  changes: PixelChange[];
+}
+
+// ---- Errors & control frames ----
+/**
+ * Standard error codes for client-server communication.
+ * These provide structured error handling and enable appropriate
+ * client responses (retry, authentication, etc.).
+ */
+export type ErrorCode =
+  | 'BAD_REQUEST' // malformed request or invalid parameters
+  | 'UNAUTHORIZED' // authentication required or invalid
+  | 'FORBIDDEN' // authenticated but not permitted (banned, protected area)
+  | 'NOT_FOUND' // requested resource doesn't exist
+  | 'RATE_LIMIT' // too many requests, client should back off
+  | 'VALIDATION' // request format is correct but data is invalid
+  | 'INTERNAL'; // server error, client should retry later
+
+/**
+ * Structured error response frame.
+ * Provides consistent error reporting across all protocol operations.
+ */
+export interface ErrorFrame {
+  code: ErrorCode; // standardized error type
+  message: string; // human-readable error description
+  /**
+   * Optional additional context about the error.
+   * Examples: { field: "color", reason: "index out of range" }
+   */
+  meta?: Record<string, unknown>;
+}
+
+// ---- Rate limit hints (optional) ----
+/**
+ * Rate limiting feedback for client throttling.
+ *
+ * When a client exceeds rate limits, the server provides guidance
+ * for backing off gracefully instead of continuing to spam requests.
+ * This implements token bucket or similar algorithms.
+ */
+export interface RateLimitHint {
+  /**
+   * How long the client should wait before retrying (milliseconds).
+   * Client should implement exponential backoff based on this value.
+   */
+  retryAfterMs: number;
+  /**
+   * How many requests the client can make immediately.
+   * Optional - only exposed if server wants to share bucket state.
+   */
+  tokensRemaining?: number;
+  /**
+   * Maximum requests allowed in the current time window.
+   * Helps client understand the rate limit policy.
+   */
+  bucketSize?: number;
+  /**
+   * Rate at which the client earns new request tokens.
+   * Expressed as tokens per second (e.g., 10 means 10 requests/sec).
+   */
+  refillPerSec?: number;
+}
+
+// ---- Presence / metrics (optional server push) ----
+/**
+ * Real-time presence information for a tile.
+ *
+ * Provides awareness of how many other users are currently
+ * viewing or interacting with each tile. This can drive UI
+ * features like "X users viewing" indicators or heat maps.
+ */
+export interface TilePresence {
+  tx: TileX; // tile X coordinate
+  ty: TileY; // tile Y coordinate
+  /**
+   * Number of connected WebSocket clients currently subscribed to this tile.
+   * Updated in real-time as users pan around the canvas.
+   */
+  count: number;
+}
+
+// =======================================================
+//           WebSocket Real-Time Communication Protocol
+// =======================================================
+
+/**
+ * WebSocket event names for real-time canvas collaboration.
+ *
+ * Uses string constants to ensure compatibility with Socket.IO
+ * or native WebSocket multiplexing libraries. Each event has
+ * a strongly-typed payload defined below.
+ *
+ * The protocol follows a request-response pattern for some operations
+ * and server-push for real-time updates.
+ */
+export const WS = {
+  // ---- Client -> Server Events ----
+  SUB: 'SUB', // Subscribe to tile updates (viewport management)
+  UNSUB: 'UNSUB', // Unsubscribe from tiles no longer in view
+  PAINT: 'PAINT', // Paint a single pixel
+  PING: 'PING', // Latency measurement and connection keepalive
+
+  // ---- Server -> Client Events ----
+  INIT_TILE: 'INIT_TILE', // Initial tile state on subscription
+  DELTA: 'DELTA', // Incremental pixel changes
+  ERROR: 'ERROR', // Error notifications
+  RATE_LIMIT: 'RATE_LIMIT', // Rate limiting feedback
+  POP: 'POP', // Presence updates (user counts)
+  USER_COUNT: 'USER_COUNT', // Total connected user count
+  PONG: 'PONG', // Ping response for RTT calculation
+} as const;
+
+/**
+ * Union type of all client-to-server event names.
+ * Used for type checking and event handler registration.
+ */
+export type WsClientEvent =
+  | typeof WS.SUB
+  | typeof WS.UNSUB
+  | typeof WS.PAINT
+  | typeof WS.PING;
+
+/**
+ * Union type of all server-to-client event names.
+ * Used for type checking and event handler registration.
+ */
+export type WsServerEvent =
+  | typeof WS.INIT_TILE
+  | typeof WS.DELTA
+  | typeof WS.ERROR
+  | typeof WS.RATE_LIMIT
+  | typeof WS.POP
+  | typeof WS.USER_COUNT
+  | typeof WS.PONG;
+
+// ---- Client -> Server payloads ----
+
+/**
+ * Subscribe to real-time updates for a list of tiles.
+ *
+ * Sent when the client's viewport changes (pan/zoom) to establish
+ * which tiles need real-time updates. The server responds with
+ * INIT_TILE events containing current state.
+ */
+export interface SubPayload {
+  /**
+   * List of tile coordinates to subscribe to.
+   * Typically represents the current viewport plus a buffer zone.
+   */
+  tiles: TileCoord[];
+  /**
+   * Optional: request deltas starting from a known sequence number.
+   * Useful for reconnection - client can catch up on missed changes
+   * instead of downloading full snapshots.
+   */
+  sinceSeq?: TileSeq;
+  /**
+   * Protocol version for compatibility checking.
+   * Server rejects connections with incompatible versions.
+   */
+  protocol?: number;
+}
+
+/**
+ * Unsubscribe from tiles that are no longer visible.
+ *
+ * Sent when tiles leave the viewport to reduce server load
+ * and network traffic. Server stops sending updates for these tiles.
+ */
+export interface UnsubPayload {
+  /** List of tile coordinates to stop receiving updates for. */
+  tiles: TileCoord[];
+}
+
+/**
+ * Paint a single pixel at global coordinates.
+ *
+ * The fundamental user interaction - placing a colored pixel on the canvas.
+ * Server validates the request, converts to tile+offset coordinates,
+ * and broadcasts the change to all subscribed clients.
+ */
+export interface PaintPayload {
+  x: PixelX; // global pixel X coordinate
+  y: PixelY; // global pixel Y coordinate
+  color: ColorIndex; // palette color to paint
+  paletteId?: string; // optional palette ID (defaults to classic)
+  /**
+   * Optional idempotency key to prevent duplicate paints.
+   * Useful for handling network retries or connection issues.
+   * Server ignores paints with duplicate clientOpId within a time window.
+   */
+  clientOpId?: string;
+}
+
+/**
+ * Ping request for latency measurement and connection keepalive.
+ *
+ * Used to measure round-trip time and detect connection issues.
+ * Server responds with PONG containing the same timestamp.
+ */
+export interface PingPayload {
+  ts: number; // client timestamp in milliseconds (Date.now())
+}
+
+// ---- Server -> Client payloads ----
+
+/**
+ * Initial tile state sent on subscription.
+ *
+ * When a client subscribes to a tile, the server sends this event
+ * containing metadata for downloading the current tile snapshot.
+ * This provides the baseline state before delta updates begin.
+ */
+export interface InitTilePayload extends TileSnapshotMeta {}
+
+/**
+ * Incremental pixel changes for a tile.
+ *
+ * The core of real-time collaboration - broadcasts pixel changes
+ * to all clients subscribed to the affected tile. Clients must
+ * apply deltas in sequence order for consistency.
+ */
+export interface DeltaPayload extends TileDelta {}
+
+/**
+ * Error notification from server.
+ *
+ * Sent when client requests fail validation or encounter server issues.
+ * Client should handle errors appropriately (show user message, retry, etc.).
+ */
+export interface ErrorPayload extends ErrorFrame {}
+
+/**
+ * Rate limiting guidance for client throttling.
+ *
+ * Sent when client exceeds rate limits. Client should implement
+ * exponential backoff and respect the retry timing guidance.
+ */
+export interface RateLimitPayload extends RateLimitHint {}
+
+/**
+ * Aggregate connected user count.
+ *
+ * Broadcast whenever the total number of connected clients changes so the
+ * UI can show how many people are online.
+ */
+export interface UserCountPayload {
+  count: number;
+}
+
+/**
+ * Presence update notification.
+ *
+ * Optional server push indicating how many users are viewing each tile.
+ * Can drive UI features like activity heat maps or "N users here" indicators.
+ */
+export interface PopPayload extends TilePresence {}
+
+/**
+ * Pong response to client ping.
+ *
+ * Contains the original client timestamp plus server timestamp
+ * for accurate round-trip time calculation and clock synchronization.
+ */
+export interface PongPayload {
+  ts: number; // echo of the client's ping timestamp
+  serverTs: number; // server timestamp when pong was sent (milliseconds)
+}
+
+// ---- Event → Payload maps (for strong typing with Socket.IO) ----
+/**
+ * Type mapping for client-to-server events and their payloads.
+ * Enables compile-time type checking for event handlers and emissions.
+ */
+export interface ClientToServerEvents {
+  [WS.SUB]: (payload: SubPayload) => void;
+  [WS.UNSUB]: (payload: UnsubPayload) => void;
+  [WS.PAINT]: (payload: PaintPayload) => void;
+  [WS.PING]: (payload: PingPayload) => void;
+}
+
+/**
+ * Type mapping for server-to-client events and their payloads.
+ * Enables compile-time type checking for event handlers and emissions.
+ */
+export interface ServerToClientEvents {
+  [WS.INIT_TILE]: (payload: InitTilePayload) => void;
+  [WS.DELTA]: (payload: DeltaPayload) => void;
+  [WS.ERROR]: (payload: ErrorPayload) => void;
+  [WS.RATE_LIMIT]: (payload: RateLimitPayload) => void;
+  [WS.POP]: (payload: PopPayload) => void;
+  [WS.USER_COUNT]: (payload: UserCountPayload) => void;
+  [WS.PONG]: (payload: PongPayload) => void;
+}
+
+// =======================================================
+//          Data Persistence & Database Schema Types
+//    (Map these to your actual database schemas server-side)
+// =======================================================
+
+/**
+ * Minimal user reference for event attribution.
+ *
+ * Represents a user in the context of canvas operations.
+ * Kept lightweight to avoid bloating event records.
+ */
+export interface UserRef {
+  id: string; // unique user identifier (UUID or ULID recommended)
+  handle?: string; // optional display name or username
+  flags?: number; // bitfield for user roles, permissions, ban status, etc.
+}
+
+/**
+ * Append-only audit log of individual paint actions.
+ *
+ * Stores every pixel paint for complete history tracking.
+ * Useful for:
+ * - Moderation and abuse detection
+ * - Timelapse generation
+ * - Analytics and user behavior analysis
+ * - Rollback capabilities
+ *
+ * Uses ULID for natural time ordering in distributed systems.
+ */
+export interface PaintEvent {
+  id: string; // ULID recommended for natural chronological ordering
+  userId: string | null; // user who made the paint (null for anonymous/guest users)
+  x: PixelX; // global pixel X coordinate where paint occurred
+  y: PixelY; // global pixel Y coordinate where paint occurred
+  color: ColorIndex; // color index that was painted
+  paletteId: string; // palette used for this paint
+  createdAt: string; // ISO 8601 timestamp of when paint occurred
+}
+
+/**
+ * Batched delta records for efficient storage and transmission.
+ *
+ * Instead of storing individual pixel changes, group them into
+ * logical batches (per tile, per time window, or per user session).
+ * This reduces storage overhead and enables efficient delta streaming.
+ *
+ * The changes field can be stored as JSON, CBOR, MessagePack, or
+ * any other compact serialization format.
+ */
+export interface TileDeltaRow {
+  id: string; // ULID for chronological ordering
+  tx: TileX; // tile X coordinate this delta affects
+  ty: TileY; // tile Y coordinate this delta affects
+  seq: TileSeq; // sequence number for this delta within the tile
+  /**
+   * Compact encoded list of pixel changes in this batch.
+   * Store as JSON for simplicity, or binary formats (CBOR/MessagePack) for efficiency.
+   */
+  changes: PixelChange[];
+  createdAt: string; // ISO 8601 timestamp when delta was created
+}
+
+/**
+ * Tile snapshot registry for initial loading and delta compaction.
+ *
+ * Tracks metadata for pre-rendered tile images stored on disk or cloud storage.
+ * Snapshots are periodically generated to:
+ * - Reduce delta chain length for faster client synchronization
+ * - Provide fallback when delta reconstruction fails
+ * - Enable efficient HTTP caching with ETags
+ */
+export interface TileSnapshotRow {
+  tx: TileX; // tile X coordinate
+  ty: TileY; // tile Y coordinate
+  version: number; // increment when generating new snapshot (for cache invalidation)
+  imageUrl: string; // URL where the rendered PNG/WebP image is stored
+  seq: TileSeq; // sequence number at the time this snapshot was generated
+  paletteVersion: number; // palette version used to render this snapshot
+  createdAt: string; // ISO 8601 timestamp when snapshot was created
+}
+
+// =======================================================
+//          Content Moderation & Access Control
+// =======================================================
+
+/**
+ * Protected region definition for content moderation.
+ *
+ * Defines rectangular areas where painting is restricted or forbidden.
+ * Used for:
+ * - Preserving important artwork or logos
+ * - Creating admin-only areas
+ * - Temporary content moderation during events
+ *
+ * Server validates all paint requests against these regions.
+ */
+export interface ProtectedRegion {
+  /** Left edge of protected rectangle (global pixel coordinates) */
+  x1: PixelX;
+  /** Top edge of protected rectangle (global pixel coordinates) */
+  y1: PixelY;
+  /** Right edge of protected rectangle (global pixel coordinates) */
+  x2: PixelX;
+  /** Bottom edge of protected rectangle (global pixel coordinates) */
+  y2: PixelY;
+  /** Optional human-readable explanation for why this area is protected */
+  reason?: string;
+}
+
+/**
+ * Server-side paint validation result.
+ *
+ * Represents the outcome of validating a paint request against
+ * all server-side rules: rate limits, protected regions, user permissions, etc.
+ */
+export type PaintValidation =
+  | { ok: true } // paint is allowed, proceed with application
+  | { ok: false; error: ErrorFrame } // paint rejected due to validation error
+  | { ok: false; rateLimit: RateLimitHint }; // paint rejected due to rate limiting
+
+// =======================================================
+//               Color Palette Management
+// =======================================================
+
+/**
+ * Versioned color palette definition.
+ *
+ * Defines the complete set of colors available for painting.
+ * Versioning allows palette updates without breaking existing clients.
+ * Colors can be specified as hex strings or numeric RGBA values.
+ */
+export interface Palette {
+  id: string; // unique identifier for the palette
+  name: string; // human-readable name
+  version: number; // palette version for compatibility checking
+  /**
+   * Array of available colors for painting.
+   * Each index in this array corresponds to a ColorIndex value.
+   * Hex colors must be CSS-compatible #RRGGBB or #RRGGBBAA (RGBA order).
+   */
+  colors: readonly string[];
+}
+
+/**
+ * Collection of available palettes in the system.
+ * Users can switch between palettes for different artistic styles.
+ */
+export interface PaletteSet {
+  palettes: readonly Palette[];
+  defaultPaletteId: string;
+}
+
+/**
+ * Classic 16-color palette - the original InfiniPlace palette.
+ *
+ * Provides a balanced selection of colors including:
+ * - Primary colors (red, green, blue)
+ * - Secondary colors (cyan, magenta, yellow)
+ * - Grayscale range (black, white)
+ * - Earth tones and common UI colors
+ *
+ * This palette is designed for pixel art and collaborative drawing.
+ */
+export const CLASSIC_PALETTE: Palette = {
+  id: 'classic',
+  name: 'Classic',
+  version: 3,
+  colors: [
+    '#FFFFFFFF', // White
+    '#FFAAFFFF', // Light Pink
+    '#FF55FFFF', // Pink
+    '#FF00FFFF', // Purple/Magenta
+    '#FFFF00FF', // Yellow
+    '#FFAA00FF', // Gold
+    '#FF5500FF', // Orange
+    '#FF0000FF', // Red
+    '#00FFFFFF', // Cyan
+    '#00AAFFFF', // Light Blue
+    '#0055FFFF', // Blue
+    '#0000FFFF', // Dark Blue
+    '#00FF00FF', // Lime
+    '#00AA00FF', // Green
+    '#005500FF', // Dark Green
+    '#000000FF', // Black
+  ] as const,
+};
+
+/**
+ * Earth tones palette - perfect for landscapes and natural scenes.
+ *
+ * Features a range of browns, tans, and earth colors:
+ * - Light creams and sands for highlights
+ * - Warm tans and camels for midtones
+ * - Rich browns and deep chocolates for shadows
+ * - Near-black browns for darkest areas
+ */
+export const EARTH_PALETTE: Palette = {
+  id: 'earth',
+  name: 'Earth Tones',
+  version: 1,
+  colors: [
+    '#F3E5D0FF', // Light cream
+    '#E9D5B3FF', // Sand
+    '#DFC49AFF', // Beige tan
+    '#D4B183FF', // Light camel
+    '#C9A069FF', // Camel
+    '#B78A56FF', // Warm tan
+    '#A67845FF', // Golden brown
+    '#946838FF', // Soft brown
+    '#81572DFF', // Medium brown
+    '#6D4824FF', // Rich brown
+    '#5A3B1CFF', // Deep chestnut
+    '#4A2E17FF', // Dark chocolate
+    '#3B2312FF', // Espresso
+    '#2D1A0EFF', // Dark coffee
+    '#1F120AFF', // Very deep brown
+    '#120A05FF', // Near-black brown
+  ] as const,
+};
+
+/**
+ * Shades palette - grayscale tones for detailed shading and monochrome art.
+ *
+ * Provides a comprehensive range of grays from pure white to pure black:
+ * - Light tones for highlights and details
+ * - Mid-range grays for transitions
+ * - Dark tones for shadows and depth
+ * - Near-black for maximum contrast
+ */
+export const SHADES_PALETTE: Palette = {
+  id: 'shades',
+  name: 'Shades',
+  version: 1,
+  colors: [
+    '#FFFFFFFF', // Pure white
+    '#F5F5F5FF', // Light gray 1
+    '#EBEBEBFF', // Light gray 2
+    '#E0E0E0FF', // Light gray 3
+    '#D6D6D6FF', // Medium light gray
+    '#CCCCCCFF', // Light medium gray
+    '#C2C2C2FF', // Medium gray 1
+    '#B8B8B8FF', // Medium gray 2
+    '#ADADADFF', // Medium gray 3
+    '#A3A3A3FF', // Dark medium gray
+    '#999999FF', // Medium dark gray
+    '#8F8F8FFF', // Dark gray 1
+    '#858585FF', // Dark gray 2
+    '#7A7A7AFF', // Dark gray 3
+    '#707070FF', // Very dark gray
+    '#000000FF', // Pure black
+  ] as const,
+};
+
+/**
+ * Complete palette set containing all available palettes.
+ */
+export const PALETTE_SET: PaletteSet = {
+  palettes: [CLASSIC_PALETTE, EARTH_PALETTE, SHADES_PALETTE] as const,
+  defaultPaletteId: CLASSIC_PALETTE.id,
+};
+
+/**
+ * Get a palette by its ID.
+ */
+export const getPaletteById = (id: string): Palette | undefined => {
+  return PALETTE_SET.palettes.find((palette) => palette.id === id);
+};
+
+const PALETTE_INDEX_BY_ID: Record<string, number> = (() => {
+  const map: Record<string, number> = {};
+  PALETTE_SET.palettes.forEach((pal, idx) => {
+    map[pal.id] = idx;
+  });
+  return map;
+})();
+
+/** Resolve palette id to its ordinal within the palette set. */
+export const paletteIdToOrdinal = (id: string): number => {
+  const idx = PALETTE_INDEX_BY_ID[id];
+  return Number.isInteger(idx) ? (idx as number) : PALETTE_INDEX_BY_ID[DEFAULT_PALETTE.id];
+};
+
+/** Resolve ordinal back to palette id. */
+export const ordinalToPaletteId = (ordinal: number): string => {
+  const pal = PALETTE_SET.palettes[ordinal];
+  return pal ? pal.id : DEFAULT_PALETTE.id;
+};
+
+/**
+ * Get the default palette.
+ */
+export const DEFAULT_PALETTE: Palette = CLASSIC_PALETTE;
+
+/** Resolve the index of a color string in a palette. Accepts #RRGGBB or #RRGGBBAA. */
+export const findColorIndex = (
+  color: string,
+  palette: Palette = DEFAULT_PALETTE,
+): number => {
+  const norm = (hex: string) =>
+    hex.length === 7 ? `${hex.toUpperCase()}FF` : hex.toUpperCase();
+  const target = norm(color);
+  return palette.colors.findIndex((c) => norm(c) === target);
+};
+
+/** Baseline background color index (white) for default tiles. */
+export const DEFAULT_BASELINE_COLOR_INDEX: number = (() => {
+  const idx = findColorIndex('#FFFFFF');
+  return idx >= 0 ? idx : 0;
+})();
+
+/** Baseline palette id assigned to untouched pixels. */
+export const DEFAULT_BASELINE_PALETTE_ID: string = DEFAULT_PALETTE.id;
+
+/** Baseline palette ordinal, paired with DEFAULT_BASELINE_PALETTE_ID. */
+export const DEFAULT_BASELINE_PALETTE_ORDINAL: number = paletteIdToOrdinal(
+  DEFAULT_BASELINE_PALETTE_ID,
+);
+
+/**
+ * Runtime validation helper for color indices.
+ *
+ * Checks if a numeric value is a valid index into the given palette.
+ * Useful for validating paint requests and preventing array bounds errors.
+ */
+export const isValidColorIndex = (
+  idx: number,
+  palette: Palette = DEFAULT_PALETTE,
+): idx is ColorIndex =>
+  Number.isInteger(idx) && idx >= 0 && idx < palette.colors.length;
+
+// =======================================================
+//               Protocol Version Management
+// =======================================================
+
+/**
+ * Protocol handshake information for compatibility verification.
+ *
+ * Exchanged during connection establishment to ensure client and server
+ * are using compatible protocol versions and configuration.
+ */
+export interface HandshakeInfo {
+  protocolVersion: number; // wire protocol version (PROTOCOL_VERSION constant)
+  paletteVersion: number; // color palette version for rendering compatibility
+  tileSize: number; // tile size in pixels (TILE_SIZE constant)
+}
+
+/**
+ * Compatibility checker for protocol handshake.
+ *
+ * Validates that server and client are using compatible versions.
+ * Returns false if connection should be rejected due to version mismatch.
+ *
+ * In production, you might want more sophisticated compatibility logic
+ * that allows minor version differences or provides upgrade guidance.
+ */
+export const isCompatible = (server: HandshakeInfo): boolean =>
+  server.protocolVersion === PROTOCOL_VERSION && server.tileSize === TILE_SIZE;

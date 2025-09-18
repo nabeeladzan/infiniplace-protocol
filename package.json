@@ -1,0 +1,28 @@
+{
+  "name": "@infiniplace/protocol",
+  "version": "0.0.0",
+  "description": "Shared protocol types and utilities for InfiniPlace clients and servers.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.888.0",
+    "typescript": "^5.5.4"
+  }
+}
